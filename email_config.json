@@ -1,0 +1,7 @@
+{
+  "to": "recipient@example.com",
+  "cc": "",
+  "bcc": "",
+  "subject": "Hello from Vera Email Bot",
+  "body": "This is a test email sent via the Gmail API."
+}

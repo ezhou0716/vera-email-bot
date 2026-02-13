@@ -1,0 +1,19 @@
+# OAuth credentials and tokens - NEVER commit these
+credentials.json
+token.json
+
+# API keys config - NEVER commit this
+config.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
