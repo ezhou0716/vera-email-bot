@@ -2,10 +2,9 @@ import sys
 import json
 import time
 
-from prompt_engine import parse_prompt, generate_emails_batch, configure_genai
+from prompt_engine import parse_prompt, generate_email
 from lead_finder import find_leads
 from email_sender import authenticate_gmail, create_message, send_single_email
-from sent_history import load_history, record_sent, was_previously_contacted
 
 CONFIG_FILE = "config.json"
 
@@ -31,7 +30,6 @@ def load_config():
 
 def display_leads(leads):
     """Print a formatted summary of discovered leads."""
-    history = load_history()
     print(f"\n{'='*60}")
     print(f"  Found {len(leads)} lead(s)")
     print(f"{'='*60}")
@@ -40,11 +38,6 @@ def display_leads(leads):
         role = lead.get("role") or "(no role)"
         print(f"  {i}. {name} — {role}")
         print(f"     {lead['email']} @ {lead.get('company', '(unknown)')}")
-        contacted, info = was_previously_contacted(lead.get("email", ""), history)
-        if contacted:
-            date_str = info.get("last_sent", "unknown date")[:10]
-            count = info.get("send_count", 1)
-            print(f"     \u26a0 Previously contacted on {date_str} ({count} time{'s' if count != 1 else ''})")
     print()
 
 
@@ -74,7 +67,6 @@ def main():
 
     # Load config
     config = load_config()
-    configure_genai(config["gemini_api_key"])
     settings = config.get("settings", {})
     gemini_key = config["gemini_api_key"]
     hunter_key = config["hunter_api_key"]
@@ -91,7 +83,7 @@ def main():
     # Step 1: Parse prompt
     print(f"[1/4] Parsing prompt with Gemini...")
     try:
-        search_criteria, email_intent = parse_prompt(prompt, model_name)
+        search_criteria, email_intent = parse_prompt(prompt, gemini_key, model_name)
     except Exception as e:
         print(f"Error parsing prompt: {e}")
         sys.exit(1)
@@ -121,13 +113,17 @@ def main():
 
     display_leads(leads)
 
-    # Step 3: Generate emails (single batch API call)
-    print(f"[3/4] Generating {len(leads)} personalized email(s) in one batch...")
-    try:
-        emails = generate_emails_batch(leads, email_intent, model_name)
-    except Exception as e:
-        print(f"Error generating emails: {e}")
-        emails = [None] * len(leads)
+    # Step 3: Generate emails
+    print(f"[3/4] Generating personalized emails...")
+    emails = []
+    for i, lead in enumerate(leads, 1):
+        print(f"  Generating email {i}/{len(leads)} for {lead.get('name') or lead['email']}...")
+        try:
+            email_data = generate_email(lead, email_intent, gemini_key, model_name)
+            emails.append(email_data)
+        except Exception as e:
+            print(f"  Error generating email for {lead['email']}: {e}")
+            emails.append(None)
 
     # Step 4: Display previews
     print(f"\n{'='*60}")
@@ -170,7 +166,6 @@ def main():
         success = send_single_email(service, message, lead["email"])
         if success:
             sent += 1
-            record_sent(lead["email"], email_data["subject"])
         else:
             failed += 1
 
