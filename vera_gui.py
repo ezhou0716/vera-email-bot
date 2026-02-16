@@ -15,11 +15,12 @@ from PyQt6.QtWidgets import (
     QScrollArea, QProgressBar, QCheckBox, QMessageBox, QHeaderView,
     QFrame, QSizePolicy, QAbstractItemView,
 )
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QColor, QFont
 
-from prompt_engine import parse_prompt, generate_email, configure_genai
+from prompt_engine import parse_prompt, generate_emails_batch, configure_genai
 from lead_finder import find_leads
 from email_sender import authenticate_gmail, create_message, send_single_email
+from sent_history import load_history, record_sent, was_previously_contacted
 
 CONFIG_FILE = "config.json"
 
@@ -108,16 +109,12 @@ class EmailGenerationWorker(QThread):
 
     def run(self):
         try:
-            emails = []
             total = len(self.leads)
-            for i, lead in enumerate(self.leads):
-                try:
-                    email_data = generate_email(
-                        lead, self.email_intent, self.model_name
-                    )
-                except Exception:
-                    email_data = None
-                emails.append(email_data)
+            # Single batch call — 1 Gemini API request instead of N
+            emails = generate_emails_batch(
+                self.leads, self.email_intent, self.model_name
+            )
+            for i, email_data in enumerate(emails):
                 self.progress.emit(i, total, email_data or {})
             self.finished.emit(emails)
         except Exception as e:
@@ -171,17 +168,20 @@ class EmailSendWorker(QThread):
 # ---------------------------------------------------------------------------
 
 class LeadTableModel(QAbstractTableModel):
-    COLUMNS = ["Include", "Name", "Email", "Company", "Role"]
+    COLUMNS = ["Include", "Name", "Email", "Company", "Role", "Status"]
 
-    def __init__(self, leads=None):
+    def __init__(self, leads=None, sent_history=None):
         super().__init__()
         self._leads = leads or []
         self._checked = [True] * len(self._leads)
+        self._sent_history = sent_history or {}
 
-    def set_leads(self, leads):
+    def set_leads(self, leads, sent_history=None):
         self.beginResetModel()
         self._leads = leads
         self._checked = [True] * len(leads)
+        if sent_history is not None:
+            self._sent_history = sent_history
         self.endResetModel()
 
     def rowCount(self, parent=QModelIndex()):
@@ -198,6 +198,13 @@ class LeadTableModel(QAbstractTableModel):
         if col == 0:
             if role == Qt.ItemDataRole.CheckStateRole:
                 return Qt.CheckState.Checked if self._checked[row] else Qt.CheckState.Unchecked
+            return None
+        if col == 5:  # Status column
+            contacted, info = was_previously_contacted(lead.get("email", ""), self._sent_history)
+            if role == Qt.ItemDataRole.DisplayRole:
+                return "Previously contacted" if contacted else ""
+            if role == Qt.ItemDataRole.ForegroundRole and contacted:
+                return QColor(210, 130, 0)  # amber/orange
             return None
         keys = [None, "name", "email", "company", "role"]
         if role == Qt.ItemDataRole.DisplayRole:
@@ -241,7 +248,7 @@ class LeadTableModel(QAbstractTableModel):
 class EmailPreviewCard(QFrame):
     toggled = pyqtSignal()
 
-    def __init__(self, lead, email_data, parent=None):
+    def __init__(self, lead, email_data, sent_history=None, parent=None):
         super().__init__(parent)
         self.lead = lead
         self.setFrameShape(QFrame.Shape.StyledPanel)
@@ -262,6 +269,22 @@ class EmailPreviewCard(QFrame):
         info.setWordWrap(True)
         header.addWidget(info, 1)
         layout.addLayout(header)
+
+        # Previously-contacted warning
+        contacted, hist_info = was_previously_contacted(
+            lead.get("email", ""), sent_history
+        )
+        if contacted:
+            date_str = hist_info.get("last_sent", "unknown date")[:10]
+            count = hist_info.get("send_count", 1)
+            warning = QLabel(
+                f"\u26a0 Previously contacted on {date_str} ({count} time{'s' if count != 1 else ''})"
+            )
+            warning.setStyleSheet(
+                "background-color: #fff3cd; color: #856404; "
+                "border: 1px solid #ffc107; border-radius: 4px; padding: 4px 8px;"
+            )
+            layout.addWidget(warning)
 
         # Subject
         layout.addWidget(QLabel("Subject:"))
@@ -331,6 +354,9 @@ class VeraMainWindow(QMainWindow):
         self._scraping_timeout = settings.get("scraping_timeout_seconds", 10)
         self._scraping_max_pages = settings.get("scraping_max_pages_per_domain", 5)
 
+        # Sent history
+        self._sent_history = load_history()
+
         # Stacked widget
         self._stack = QStackedWidget()
         self.setCentralWidget(self._stack)
@@ -389,7 +415,7 @@ class VeraMainWindow(QMainWindow):
         self._criteria_label.setWordWrap(True)
         layout.addWidget(self._criteria_label)
 
-        self._lead_model = LeadTableModel()
+        self._lead_model = LeadTableModel(sent_history=self._sent_history)
         self._lead_table = QTableView()
         self._lead_table.setModel(self._lead_model)
         self._lead_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -518,7 +544,8 @@ class VeraMainWindow(QMainWindow):
             return
 
         self._leads = leads
-        self._lead_model.set_leads(leads)
+        self._sent_history = load_history()  # refresh in case new sends happened
+        self._lead_model.set_leads(leads, self._sent_history)
 
         # Resize columns nicely
         header = self._lead_table.horizontalHeader()
@@ -575,7 +602,7 @@ class VeraMainWindow(QMainWindow):
         lead = self._leads[index]
         self._email_gen_status.setText(f"Generating email {index + 1}/{total}...")
         if email_data:
-            card = EmailPreviewCard(lead, email_data)
+            card = EmailPreviewCard(lead, email_data, sent_history=self._sent_history)
             card.toggled.connect(self._update_send_count)
             self._email_list_layout.addWidget(card)
             self._email_cards.append(card)
@@ -651,6 +678,9 @@ class VeraMainWindow(QMainWindow):
         status = "Sent" if success else "FAILED"
         self._send_log.append(f"  [{index + 1}/{self._send_list_count}] {recipient} — {status}")
         self._progress_bar.setValue(index + 1)
+        if success:
+            subject = self._send_data[index][1]  # (to, subject, body)
+            record_sent(recipient, subject)
 
     def _on_send_done(self, sent, failed):
         self._summary_label.setText(f"Done!  Sent: {sent}  |  Failed: {failed}")

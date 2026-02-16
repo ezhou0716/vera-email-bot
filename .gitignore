@@ -5,6 +5,9 @@ token.json
 # API keys config - NEVER commit this
 config.json
 
+# Sent history - contains recipient data
+sent_history.json
+
 # Python
 __pycache__/
 *.pyc

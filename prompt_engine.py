@@ -1,24 +1,29 @@
 import json
 import time
 
-import google.generativeai as genai
+from google import genai
+
+# Module-level client, set by configure_genai()
+_client = None
 
 
 def configure_genai(api_key):
-    """Configure the Gemini API key."""
-    genai.configure(api_key=api_key)
+    """Configure the Gemini API client."""
+    global _client
+    _client = genai.Client(api_key=api_key)
 
 
-
-def _call_gemini_with_retry(model, prompt, max_retries=3):
+def _call_gemini_with_retry(model_name, prompt, max_retries=3):
     """Call Gemini API with exponential backoff on 429 (rate limit) errors.
 
-    Retries after 5s, 10s, 20s before giving up.
+    Retries after 10s, 30s, 60s before giving up.
     """
     delays = [10, 30, 60]
     for attempt in range(max_retries + 1):
         try:
-            response = model.generate_content(prompt)
+            response = _client.models.generate_content(
+                model=model_name, contents=prompt
+            )
             return response.text
         except Exception as e:
             error_str = str(e)
@@ -30,15 +35,22 @@ def _call_gemini_with_retry(model, prompt, max_retries=3):
                 raise
 
 
-def parse_prompt(prompt, model_name="gemini-2.0-flash"):
+def _strip_markdown_fences(text):
+    """Strip markdown code fences from Gemini responses."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    return text.strip()
+
+
+def parse_prompt(prompt, model_name="gemini-2.5-flash-lite"):
     """Parse a natural language outreach prompt into structured data.
 
     Returns:
         tuple: (search_criteria, email_intent) dicts
     """
-    model = genai.GenerativeModel(model_name)
-    model = genai.GenerativeModel(model_name)
-
     system_prompt = f"""You are a sales outreach assistant. Analyze the user's prompt and extract two JSON objects.
 
 User prompt: "{prompt}"
@@ -67,22 +79,14 @@ Rules:
 - Always provide at least one role and one key point
 - Return ONLY the JSON object, nothing else"""
 
-    raw = _call_gemini_with_retry(model, system_prompt)
-
-    # Strip markdown fences if Gemini wraps the response
-    text = raw.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-    if text.endswith("```"):
-        text = text[:-3]
-    text = text.strip()
-
+    raw = _call_gemini_with_retry(model_name, system_prompt)
+    text = _strip_markdown_fences(raw)
     parsed = json.loads(text)
     return parsed["search_criteria"], parsed["email_intent"]
 
 
-def generate_email(lead, email_intent, model_name="gemini-2.0-flash"):
-    """Generate a personalized outreach email for a specific lead.
+def generate_email(lead, email_intent, model_name="gemini-2.5-flash-lite"):
+    """Generate a personalized outreach email for a single lead.
 
     Args:
         lead: dict with keys name, email, company, role
@@ -91,9 +95,6 @@ def generate_email(lead, email_intent, model_name="gemini-2.0-flash"):
     Returns:
         dict with 'subject' and 'body' keys
     """
-    model = genai.GenerativeModel(model_name)
-    model = genai.GenerativeModel(model_name)
-
     prompt = f"""Write a personalized cold outreach email.
 
 Recipient details:
@@ -122,13 +123,86 @@ Rules:
 - Sign off as "Best" with no sender name (the sender will add their own signature)
 - Use plain text only, no HTML or markdown formatting"""
 
-    raw = _call_gemini_with_retry(model, prompt)
-
-    text = raw.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-    if text.endswith("```"):
-        text = text[:-3]
-    text = text.strip()
-
+    raw = _call_gemini_with_retry(model_name, prompt)
+    text = _strip_markdown_fences(raw)
     return json.loads(text)
+
+
+def generate_emails_batch(leads, email_intent, model_name="gemini-2.5-flash-lite"):
+    """Generate personalized outreach emails for ALL leads in a single API call.
+
+    This dramatically reduces Gemini API usage: 1 call instead of N.
+
+    Args:
+        leads: list of dicts with keys name, email, company, role
+        email_intent: dict with purpose, product_or_topic, key_points, tone
+
+    Returns:
+        list of dicts, each with 'subject' and 'body' keys (or None on failure).
+        Length matches len(leads).
+    """
+    if not leads:
+        return []
+
+    # Build the recipient list for the prompt
+    recipients_block = ""
+    for i, lead in enumerate(leads, 1):
+        recipients_block += (
+            f"\nRecipient {i}:\n"
+            f"  Name: {lead.get('name', 'there')}\n"
+            f"  Role: {lead.get('role', 'Professional')}\n"
+            f"  Company: {lead.get('company', 'their company')}\n"
+            f"  Email: {lead.get('email', '')}\n"
+        )
+
+    prompt = f"""Write personalized cold outreach emails for each of the following {len(leads)} recipients.
+
+{recipients_block}
+Email intent (same for all):
+- Purpose: {email_intent['purpose']}
+- Product/Topic: {email_intent['product_or_topic']}
+- Key points to mention: {json.dumps(email_intent['key_points'])}
+- Tone: {email_intent['tone']}
+
+Return ONLY a valid JSON array with exactly {len(leads)} objects, one per recipient in order. No markdown fences, no explanation:
+[
+  {{"subject": "email subject line for recipient 1", "body": "full email body for recipient 1"}},
+  {{"subject": "email subject line for recipient 2", "body": "full email body for recipient 2"}}
+]
+
+Rules (apply to EVERY email):
+- Subject line must be under 60 characters
+- Body must be under 150 words
+- Include a clear call-to-action (e.g. book a call, reply, check a link)
+- Do NOT use placeholder brackets like [Name] or [Company] — use the actual values provided
+- Personalize each email based on that recipient's role and company — each email should feel unique
+- Sign off as "Best" with no sender name (the sender will add their own signature)
+- Use plain text only, no HTML or markdown formatting
+- Return EXACTLY {len(leads)} email objects in the array, in the same order as the recipients"""
+
+    raw = _call_gemini_with_retry(model_name, prompt)
+    text = _strip_markdown_fences(raw)
+
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list) and len(parsed) == len(leads):
+            return parsed
+        # If length mismatch, pad or truncate
+        if isinstance(parsed, list):
+            results = []
+            for i in range(len(leads)):
+                results.append(parsed[i] if i < len(parsed) else None)
+            return results
+    except (json.JSONDecodeError, KeyError):
+        pass
+
+    # Batch failed — fall back to individual calls
+    print("  Batch generation failed, falling back to individual emails...")
+    results = []
+    for lead in leads:
+        try:
+            email_data = generate_email(lead, email_intent, model_name)
+            results.append(email_data)
+        except Exception:
+            results.append(None)
+    return results
